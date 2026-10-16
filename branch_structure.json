@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-586-stab-be-007-normalize-environment-schema-and",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-586-stab-be-007-normalize-environment-schema-and": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-586-stab-be-007-normalize-environment-schema-and",
+    "origin"
+  ]
+}
