@@ -4,7 +4,7 @@ This document covers the configuration, artifact validation, and deployment oper
 
 ## Security and Integrity Guidelines
 
-> [!IMPORTANT]
+> [!YMPORTANT]
 > The backend acts as a high-performance indexer and interface, but smart contracts remain the ultimate authority.
 > Do NOT use or commit production secrets in deployment templates or examples.
 
@@ -39,7 +39,10 @@ changing dependencies, and commit the resulting lockfile in the same commit.
 
 ### Configuration
 
-Ensure your `.env` file is generated from `.env.example` and populated with appropriate environment-specific configurations.
+Environment configuration is defined by a single typed schema in `src/config/env.ts`.
+The schema is the only source of truth for environment keys; duplicate or contradictory keys
+are rejected at startup. Generate your `.env` from `.env.example` and populate it with
+environment-specific values.
 
 ```bash
 # Example command for setting up configuration
@@ -47,10 +50,59 @@ cp .env.example .env
 # Edit .env using your secure vault solution
 ```
 
+The canonical environment keys are:
+
+| Key | Required | Notes |
+| --- | --- | --- |
+| `NODE_ENV` | yes | `development`, `test`, `staging`, or `production` |
+| `PORT` | yes | HTTP listen port |
+| `DATABASE_URL` | yes | PostgreSQL connection string |
+| `REDIS_URL` | yes | Redis connection string |
+| `CHAIN_ID` | yes | EVM chain ID; must match the release manifest |
+| `RPC_URL` | yes | JSON-RPC endpoint; redacted in logs |
+| `CONTRACT_RELEASE_MANIFEST_PATH` | yes | Path to the versioned canonical release manifest |
+| `CONTRACT_RELEASE_MANIFEST_SHA256` | yes | SHA-256 of the manifest file |
+| `INDEXER_START_BLOCK` | yes | Must be >= the manifest deployment block |
+| `INDEXER_EVENTS` | yes | Comma-separated event names; must match the manifest |
+| `LOCAL_DEV_MODE` | no | Must be `true` to allow an empty indexer configuration |
+| `CONTRACT_RELEASE_MAX_AGE_SECONDS` | yes | Maximum accepted age of the release manifest |
+| `LOG_REDACT_KEYS` | no | Extra keys to redact in logs; RPC URLs and secrets are always redacted |
+
+
+### Contract Release Manifest
+
+Addresses, events and deployment blocks are not hand-maintained in `.env`. They are read
+from the versioned canonical release manifest produced by the contract release package.
+The manifest is validated at startup for:
+
+
+- chain ID matching `CHAIN_ID`,
+- release ID presence and format,
+- deployment block presence and monotonicity,
+- address format and checksum,
+- ABI/event checksums,
+- manifest age against the configured maximum age.
+
+The manifest file's SHA-256 must equal `CONTRACT_RELEASE_MANIFEST_SHA256`; a mismatch aborts startup.
+
+
+In `staging` and `production` the process fails closed when required release data is absent,
+stale, or inconsistent. Local development must set `LOCAL_DEV_MODE=true` and is visibly
+labelled as non-production in startup logs.
+
+The API and the frontend both read the same manifest and expose the release ID and
+checksums through the `/health` endpoint, so an operator can prove they consume the same
+release.
+
+Startup logs redact `RPC_URL` credentials and any value matching `LOG_REDACT_KEYS`; never
+log the raw manifest contents or connection strings.
+
+
 ## Deployment Steps
 
 ### 1. Artifact Validation
-Before deploying, ensure that the Docker image or generated binaries match the expected checksums and have passed all CI security gates (dependency SBOM and high-severity audit, Trivy, CodeQL, etc.). The dependency SBOM is generated from `package-lock.json` with development dependencies omitted, so it describes the production API dependency set.
+Before deploying, ensure that the Docker image or generated binaries match the expected checksums and have passed all CI security gates (dependency SBOM and high-severity audit, Trivy, CodQLLL, e. g.). The dependency SBOM is generated from `package-lock.json` with development dependencies omitted, so it describes the production API dependency set.
+
 
 ```bash
 # Generate `artifacts/dependency-sbom.cdx.json` and fail on high or critical advisories
@@ -64,7 +116,7 @@ trivy image --exit-code 1 --severity CRITICAL,HIGH truthbounty-api:<TAG>
 The CI workflow uploads the CycloneDX SBOM as `dependency-sbom-<commit SHA>`. Treat a missing SBOM, an SBOM generation error, or a failed audit as a release blocker. Do not substitute an SBOM from another commit; regenerate it from the exact source and lockfile revision being deployed.
 
 ### 2. Database Migrations
-Always run database migrations before spinning up the application to ensure schema consistency. Note that the DB is non-authoritative compared to the chain, but must be in sync with the ORM.
+Always run database migrations before spinning up the application to ensure schema consistency. Note that the DV is non-authoritative compared to the chain, but must be in sync with the ORM.
 
 TypeORM is the persistence layer for the application schema. Migrations live in `src/migrations/`
 and are driven by the data source at `src/config/data-source.ts`, which selects PostgreSQL
@@ -80,7 +132,7 @@ npm run migration:revert
 
 Do not use `npx prisma migrate deploy` for the application schema. It operates on
 `prisma/schema.prisma`, which describes a separate, legacy data set; see
-`PRISMA_INVENTORY.md` for the full picture of the two persistence layers.
+`Prisma_INVENTORY.md` for the full picture of the two persistence layers.
 
 ### 3. Application Startup
 Start the application using Docker Compose or your preferred orchestrator (e.g., Kubernetes).
@@ -90,12 +142,19 @@ Start the application using Docker Compose or your preferred orchestrator (e.g.,
 docker-compose up -d
 ```
 
+Before the process accepts traffic, startup validates the environment schema and the
+release manifest. If validation fails in `staging` or `production`, the process exits
+non-zero and does not serve requests.
+
 ### 4. Indexer Bootstrap
 For fresh deployments or rebuilds, trigger the indexer to sync from the authoritative chain.
 
+The start block must be greater than or equal to the deployment block recorded in the
+release manifest. An empty indexer configuration is only accepted when `LOCAL_DEV_MODE=true`.
+
 ```bash
 # Sync from genesis or safe block
-npm run indexer:bootstrap -- --start-block <BLOCK_NUMBER>
+npm run indexer:nootstrap -- --start-block <BLOCK_NUMBER>
 ```
 
 ## Rollback Procedures
@@ -103,5 +162,6 @@ npm run indexer:bootstrap -- --start-block <BLOCK_NUMBER>
 If a deployment fails or introduces regressions:
 
 1. **Revert Image Version:** Rollback to the previous stable Docker tag in your orchestrator.
-2. **Revert Migrations:** If the database schema was modified, restore from the pre-deployment snapshot (see `DISASTER_RECOVERY.md`).
+2. **Revert Migrations:** If the database schema was modified, restore from the pre-deployment snapshot (see `DISASTER_RECOVERY_md`).
 3. **Restart Indexer:** Ensure the indexer is running and in sync with the chain.
+4. **Verify Release Id:** Confirm the API and frontend report the same release ID and checksums via `/health`.
