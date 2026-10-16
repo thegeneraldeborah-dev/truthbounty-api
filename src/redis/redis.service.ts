@@ -249,6 +249,57 @@ export class RedisService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Execute a Lua script
+   */
+  async eval(script: string, numKeys: number, ...args: any[]): Promise<any> {
+    if (!this.client || !this.isConnected) {
+      this.logger.error('Redis unavailable, failing closed for rate limit');
+      throw new Error('Redis unavailable (Fail Closed)');
+    }
+
+    try {
+      return await this.client.eval(script, numKeys, ...args);
+    } catch (error) {
+      this.logger.error(`Redis EVAL error: ${error.message}`);
+      throw new Error('Redis operation failed (Fail Closed)');
+    }
+  }
+
+  /**
+   * Return remaining TTL in milliseconds for a key
+   */
+  async pttl(key: string): Promise<number> {
+    if (!this.client || !this.isConnected) {
+      this.logger.error('Redis unavailable, failing closed for rate limit');
+      throw new Error('Redis unavailable (Fail Closed)');
+    }
+
+    try {
+      return await this.client.pttl(key);
+    } catch (error) {
+      this.logger.error(`Redis PTTL error for key ${key}: ${error.message}`);
+      throw new Error('Redis operation failed (Fail Closed)');
+    }
+  }
+
+  /**
+   * Check if key exists
+   */
+  async exists(key: string): Promise<number> {
+    if (!this.client || !this.isConnected) {
+      this.logger.error('Redis unavailable, failing closed for rate limit');
+      throw new Error('Redis unavailable (Fail Closed)');
+    }
+
+    try {
+      return await this.client.exists(key);
+    } catch (error) {
+      this.logger.error(`Redis EXISTS error for key ${key}: ${error.message}`);
+      throw new Error('Redis operation failed (Fail Closed)');
+    }
+  }
+
+  /**
    * Check if Redis is healthy and connected
    */
   async isHealthy(): Promise<boolean> {
