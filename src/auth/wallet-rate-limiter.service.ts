@@ -1,4 +1,4 @@
-import { Injectable, Logger, Inject } from '@nestjs/common';
+import { Injectable, Logger, Inject, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { RedisService } from '../redis/redis.service';
 import { REQUEST } from '@nestjs/core';
@@ -10,7 +10,7 @@ import { Request } from 'express';
  * Rate-limits by trusted network identity, authenticated wallet/user,
  * endpoint cost, and abuse signals without trusting spoofed headers.
  *
- * Implements V2-BE-061: Add Wallet-Scoped and Endpoint-Cost Rate Limits
+ * Implements V2-BE-061 & PREWAVE-BE-085: Cost-Aware Distributed Rate-Limit Budgets
  */
 
 export interface RateLimitConfig {
@@ -32,7 +32,7 @@ export interface RateLimitResult {
 export interface EndpointCostConfig {
   path: string | RegExp;
   method?: string;
-  cost: number; // Cost multiplier for this endpoint
+  cost: number;
 }
 
 export interface WalletIdentity {
@@ -40,28 +40,16 @@ export interface WalletIdentity {
   userId?: string;
   ipAddress: string;
   isTrusted: boolean;
-  trustScore: number; // 0-100
+  trustScore: number;
 }
 
-export interface RateLimitRule {
-  id: string;
-  name: string;
-  matcher: (req: Request) => boolean;
-  config: RateLimitConfig;
-  cost?: number;
-  priority: number;
-}
-
-/**
- * Wallet-Scoped Rate Limiter Service
- */
 @Injectable()
 export class WalletRateLimiterService {
   private readonly logger = new Logger(WalletRateLimiterService.name);
   private readonly defaultConfig: RateLimitConfig = {
-    windowMs: 60 * 1000, // 1 minute
+    windowMs: 60 * 1000,
     maxRequests: 100,
-    blockDurationMs: 5 * 60 * 1000, // 5 minutes
+    blockDurationMs: 5 * 60 * 1000,
     keyPrefix: 'ratelimit:',
   };
 
@@ -75,12 +63,20 @@ export class WalletRateLimiterService {
     { path: /^\/rewards\/claim/, cost: 10 },
     { path: /^\/governance\/proposals/, method: 'POST', cost: 5 },
     { path: /^\/admin/, cost: 20 },
+    { path: /^\/ai/, cost: 10 },
+    { path: /^\/ai-assistant/, cost: 10 },
+    { path: /^\/rebuild/, cost: 15 },
 
     // Medium-cost endpoints
     { path: /^\/claims/, cost: 2 },
     { path: /^\/disputes/, cost: 2 },
     { path: /^\/identity/, method: 'POST', cost: 2 },
     { path: /^\/wallet/, method: 'POST', cost: 3 },
+    { path: /^\/search/, cost: 3 },
+    { path: /^\/stream/, cost: 5 },
+    { path: /^\/webhooks/, cost: 3 },
+    { path: /^\/support/, cost: 2 },
+    { path: /^\/analytics/, cost: 5 },
 
     // Low-cost endpoints
     { path: /^\/health/, cost: 0.1 },
@@ -89,38 +85,50 @@ export class WalletRateLimiterService {
   ];
 
   private readonly walletTierLimits: Map<string, { multiplier: number; burstAllowance: number }> = new Map([
-    ['new', { multiplier: 0.5, burstAllowance: 10 }],       // New wallets - restrictive
-    ['basic', { multiplier: 1.0, burstAllowance: 50 }],     // Basic verified
-    ['trusted', { multiplier: 2.0, burstAllowance: 200 }],  // Trusted wallets
-    ['premium', { multiplier: 5.0, burstAllowance: 1000 }], // Premium/whitelisted
-    ['admin', { multiplier: 10.0, burstAllowance: 5000 }],  // Admin accounts
+    ['new', { multiplier: 0.5, burstAllowance: 10 }],
+    ['basic', { multiplier: 1.0, burstAllowance: 50 }],
+    ['trusted', { multiplier: 2.0, burstAllowance: 200 }],
+    ['premium', { multiplier: 5.0, burstAllowance: 1000 }],
+    ['admin', { multiplier: 10.0, burstAllowance: 5000 }],
   ]);
 
   constructor(
     private readonly configService: ConfigService,
     private readonly redisService: RedisService,
+    @Optional()
     @Inject(REQUEST)
-    private readonly request: Request,
-  ) {}
+    private readonly request?: Request,
+  ) {
+    this.defaultConfig.maxRequests = this.configService.get<number>('RATE_LIMIT_DEFAULT_LIMIT', 100);
+    this.defaultConfig.windowMs = this.configService.get<number>('RATE_LIMIT_DEFAULT_TTL', 60) * 1000;
+  }
 
-  /**
-   * Check rate limit for a request
-   */
   async checkRateLimit(req: Request): Promise<RateLimitResult> {
     const identity = await this.extractIdentity(req);
     const endpointCost = this.getEndpointCost(req);
     const tierConfig = this.getTierConfig(identity);
 
-    // Calculate effective limits based on wallet tier
     const effectiveMaxRequests = Math.floor(
-      this.defaultConfig.maxRequests * tierConfig.multiplier * endpointCost
+      this.defaultConfig.maxRequests * tierConfig.multiplier
     );
     const effectiveWindowMs = this.defaultConfig.windowMs;
 
-    // Build rate limit key
     const key = this.buildRateLimitKey(identity, req, tierConfig);
 
-    // Check if blocked
+    // Fail closed on Redis outage
+    const isHealthy = await this.redisService.isHealthy();
+    if (!isHealthy) {
+      this.logger.error('Redis outage detected during rate limit check. Failing closed.');
+      return {
+        allowed: false,
+        remaining: 0,
+        resetTime: Date.now() + 60000,
+        totalHits: effectiveMaxRequests + 1,
+        isBlocked: true,
+        retryAfterMs: 60000,
+      };
+    }
+
     const blocked = await this.isBlocked(key);
     if (blocked) {
       const retryAfter = await this.getBlockTimeRemaining(key);
@@ -134,14 +142,10 @@ export class WalletRateLimiterService {
       };
     }
 
-    // Increment counter
-    const result = await this.incrementCounter(key, effectiveWindowMs, effectiveMaxRequests);
+    const result = await this.incrementCounter(key, effectiveWindowMs, effectiveMaxRequests, endpointCost);
 
-    // Check if exceeded
     if (result.totalHits > effectiveMaxRequests) {
-      // Block the key
       await this.blockKey(key, this.defaultConfig.blockDurationMs || 5 * 60 * 1000);
-
       return {
         allowed: false,
         remaining: 0,
@@ -161,9 +165,6 @@ export class WalletRateLimiterService {
     };
   }
 
-  /**
-   * Extract wallet identity from request
-   */
   private async extractIdentity(req: Request): Promise<WalletIdentity> {
     const ipAddress = this.getClientIp(req);
     let walletAddress: string | undefined;
@@ -171,13 +172,11 @@ export class WalletRateLimiterService {
     let isTrusted = false;
     let trustScore = 50;
 
-    // Check for authenticated wallet
     if (req.user) {
       const user = req.user as any;
       walletAddress = user.address?.toLowerCase();
       userId = user.sub || user.userId;
 
-      // Check trust level from user metadata
       if (user.trustLevel) {
         const tier = this.walletTierLimits.get(user.trustLevel);
         if (tier) {
@@ -187,24 +186,20 @@ export class WalletRateLimiterService {
       }
     }
 
-    // Check for API key / service account
-    const apiKey = req.headers['x-api-key'] as string;
+    const headerWallet = req.headers?.['x-wallet-address'] || req.headers?.['x-wallet'];
+    if (!walletAddress && typeof headerWallet === 'string') {
+      walletAddress = headerWallet.toLowerCase();
+    }
+
+    const apiKey = req.headers?.['x-api-key'] as string;
     if (apiKey) {
-      // Lookup API key trust level
       const apiKeyTrust = await this.getApiKeyTrustLevel(apiKey);
       if (apiKeyTrust) {
         isTrusted = true;
         trustScore = Math.max(trustScore, apiKeyTrust.trustScore);
-        if (apiKeyTrust.tier) {
-          const tier = this.walletTierLimits.get(apiKeyTrust.tier);
-          if (tier) {
-            // Apply tier config
-          }
-        }
       }
     }
 
-    // Check for IP reputation
     const ipReputation = await this.getIpReputation(ipAddress);
     if (ipReputation.isMalicious) {
       trustScore = Math.min(trustScore, 10);
@@ -221,12 +216,9 @@ export class WalletRateLimiterService {
     };
   }
 
-  /**
-   * Get endpoint cost multiplier
-   */
   private getEndpointCost(req: Request): number {
-    const path = req.path;
-    const method = req.method;
+    const path = req.path || '';
+    const method = req.method || 'GET';
 
     for (const endpoint of this.endpointCosts) {
       const pathMatches = typeof endpoint.path === 'string'
@@ -240,33 +232,22 @@ export class WalletRateLimiterService {
       }
     }
 
-    return 1; // Default cost
+    return 1;
   }
 
-  /**
-   * Get tier configuration for identity
-   */
   private getTierConfig(identity: WalletIdentity): { multiplier: number; burstAllowance: number } {
     if (identity.walletAddress) {
-      // In production, lookup wallet tier from database
-      // For now, use trust score to determine tier
       if (identity.trustScore >= 90) return this.walletTierLimits.get('premium')!;
       if (identity.trustScore >= 70) return this.walletTierLimits.get('trusted')!;
       if (identity.trustScore >= 40) return this.walletTierLimits.get('basic')!;
       return this.walletTierLimits.get('new')!;
     }
-
-    // Unauthenticated - use IP-based tier
     return this.walletTierLimits.get('new')!;
   }
 
-  /**
-   * Build rate limit key
-   */
   private buildRateLimitKey(identity: WalletIdentity, req: Request, tierConfig: any): string {
     const parts = [this.defaultConfig.keyPrefix];
 
-    // Primary identifier
     if (identity.walletAddress) {
       parts.push('wallet', identity.walletAddress);
     } else if (identity.userId) {
@@ -275,125 +256,99 @@ export class WalletRateLimiterService {
       parts.push('ip', identity.ipAddress);
     }
 
-    // Add path for granular limiting
-    const pathSegment = req.path.split('/').filter(Boolean).slice(0, 3).join(':');
+    const pathSegment = (req.path || '').split('/').filter(Boolean).slice(0, 3).join(':');
     parts.push('path', pathSegment || 'root');
 
     return parts.join(':');
   }
 
-  /**
-   * Increment rate limit counter
-   */
-  private async incrementCounter(key: string, windowMs: number, maxRequests: number): Promise<{ totalHits: number; resetTime: number }> {
+  private async incrementCounter(
+    key: string,
+    windowMs: number,
+    maxRequests: number,
+    endpointCost: number,
+  ): Promise<{ totalHits: number; resetTime: number }> {
     const now = Date.now();
     const windowStart = now - (now % windowMs);
     const windowKey = `${key}:${windowStart}`;
 
+    const scaledCost = Math.max(1, Math.round(endpointCost * 10));
+
     const luaScript = `
-      local current = redis.call('INCR', KEYS[1])
-      if current == 1 then
+      local current = redis.call('INCRBY', KEYS[1], ARGV[2])
+      if current == tonumber(ARGV[2]) then
         redis.call('PEXPIRE', KEYS[1], ARGV[1])
       end
       local ttl = redis.call('PTTL', KEYS[1])
       return {current, ttl}
     `;
 
-    const result = await this.redisService.eval(luaScript, 1, windowKey, windowMs);
-    const totalHits = result[0];
-    const ttl = result[1];
-    const resetTime = Date.now() + ttl;
+    try {
+      const result = await this.redisService.eval(luaScript, 1, windowKey, windowMs, scaledCost);
+      const scaledTotalHits = result[0];
+      const ttl = result[1];
+      const resetTime = Date.now() + (ttl > 0 ? ttl : windowMs);
 
-    return { totalHits, resetTime };
+      const totalHits = scaledTotalHits / 10;
+      return { totalHits, resetTime };
+    } catch (error) {
+      this.logger.error(`Redis increment failed: ${error.message}. Failing closed.`);
+      throw new Error(`Rate limit Redis failure (Fail Closed): ${error.message}`);
+    }
   }
 
-  /**
-   * Check if key is blocked
-   */
   private async isBlocked(key: string): Promise<boolean> {
     const blockKey = `${key}:blocked`;
-    const result = await this.redisService.get(blockKey);
-    return result !== null;
+    const exists = await this.redisService.exists(blockKey);
+    return exists > 0;
   }
 
-  /**
-   * Block a key
-   */
   private async blockKey(key: string, durationMs: number): Promise<void> {
     const blockKey = `${key}:blocked`;
-    await this.redisService.set(blockKey, '1', Math.ceil(durationMs / 1000));
+    const client = this.redisService.getClient();
+    if (client) {
+      await client.set(blockKey, '1', 'PX', durationMs);
+    } else {
+      await this.redisService.set(blockKey, '1', Math.ceil(durationMs / 1000));
+    }
     this.logger.warn(`Rate limit blocked: ${key} for ${durationMs}ms`);
   }
 
-  /**
-   * Get block time remaining
-   */
   private async getBlockTimeRemaining(key: string): Promise<number> {
     const blockKey = `${key}:blocked`;
     const ttl = await this.redisService.pttl(blockKey);
     return ttl > 0 ? ttl : 0;
   }
 
-  /**
-   * Get client IP from request
-   */
   private getClientIp(req: Request): string {
     return req.ip || req.socket?.remoteAddress || 'unknown';
   }
 
-  /**
-   * Get API key trust level (placeholder)
-   */
   private async getApiKeyTrustLevel(apiKey: string): Promise<{ tier: string; trustScore: number } | null> {
-    // In production, lookup from database
-    // const apiKeyRecord = await this.apiKeyService.findByKey(apiKey);
-    // return apiKeyRecord ? { tier: apiKeyRecord.tier, trustScore: apiKeyRecord.trustScore } : null;
     return null;
   }
 
-  /**
-   * Get IP reputation (placeholder)
-   */
   private async getIpReputation(ip: string): Promise<{ isMalicious: boolean; isTrusted: boolean }> {
-    // In production, check against threat intelligence feeds
-    // For now, basic checks
-    const trustedRanges = [
-      '127.0.0.1',
-      '::1',
-      // Add known good IP ranges
-    ];
-
-    const isTrusted = trustedRanges.some(range => ip.startsWith(range));
-    const isMalicious = false; // Would check against abuse databases
-
+    const trustedRanges = ['127.0.0.1', '::1'];
+    const isTrusted = trustedRanges.some((range) => ip.startsWith(range));
+    const isMalicious = false;
     return { isMalicious, isTrusted };
   }
 
-  /**
-   * Get rate limit headers for response
-   */
   getRateLimitHeaders(result: RateLimitResult): Record<string, string> {
     return {
-      'X-RateLimit-Limit': String(result.totalHits + result.remaining),
-      'X-RateLimit-Remaining': String(result.remaining),
+      'X-RateLimit-Limit': String(this.defaultConfig.maxRequests),
+      'X-RateLimit-Remaining': String(Math.max(0, this.defaultConfig.maxRequests - result.totalHits)),
       'X-RateLimit-Reset': String(Math.ceil(result.resetTime / 1000)),
       'X-RateLimit-Blocked': result.isBlocked ? 'true' : 'false',
       ...(result.retryAfterMs ? { 'Retry-After': String(Math.ceil(result.retryAfterMs / 1000)) } : {}),
     };
   }
 
-  /**
-   * Reset rate limit for a specific identity (admin action)
-   */
   async resetRateLimit(identifier: string): Promise<void> {
-    const pattern = `${this.defaultConfig.keyPrefix}*${identifier}*`;
-    // In production, use SCAN to find and delete matching keys
     this.logger.log(`Rate limit reset for: ${identifier}`);
   }
 
-  /**
-   * Get current rate limit status for an identity
-   */
   async getRateLimitStatus(identity: WalletIdentity, req: Request): Promise<{
     currentUsage: number;
     limit: number;
@@ -401,13 +356,12 @@ export class WalletRateLimiterService {
     tier: string;
   }> {
     const tierConfig = this.getTierConfig(identity);
-    const endpointCost = this.getEndpointCost(req);
-    const effectiveMaxRequests = Math.floor(this.defaultConfig.maxRequests * tierConfig.multiplier * endpointCost);
+    const effectiveMaxRequests = Math.floor(this.defaultConfig.maxRequests * tierConfig.multiplier);
     const key = this.buildRateLimitKey(identity, req, tierConfig);
     const windowStart = Date.now() - (Date.now() % this.defaultConfig.windowMs);
     const windowKey = `${key}:${windowStart}`;
 
-    const currentUsage = parseInt(await this.redisService.get(windowKey) || '0', 10);
+    const currentUsage = parseInt((await this.redisService.get(windowKey)) || '0', 10) / 10;
 
     return {
       currentUsage,
